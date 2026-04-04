@@ -11,18 +11,37 @@ Users running `helm install` only see stable versions. Beta versions require `--
 
 ## Development Flow
 
-1. Merge PRs to main
-2. CI builds images and creates a beta bump PR (e.g. `0.2.1-beta.12345`)
-3. Merge the bump PR to publish the beta chart
-4. Repeat — each merge produces a new beta
+```
+  PR merged to main
+        │
+        ▼
+  ┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐
+  │ CI: Build   │────>│ CI: Bump PR      │────>│ Merge bump PR       │
+  │ 3 images    │     │ 0.2.1-beta.12345 │     │ → publishes beta    │
+  └─────────────┘     └──────────────────┘     └─────────────────────┘
+                                                        │
+        ┌───────────────────────────────────────────────┘
+        ▼
+  helm install ... --version 0.2.1-beta.12345   (explicit only)
+  helm install ...                               (still gets 0.2.0 stable)
+```
 
 ## Stable Release
 
-1. Go to **Actions → Build & Release → Run workflow**
-2. Select bump type (`patch`, `minor`, or `major`)
-3. Check **Stable release** ✅
-4. Run — CI creates a bump PR with a clean version (e.g. `0.2.1`)
-5. Approve and merge the bump PR
+```
+  Actions → Build & Release → Run workflow
+  [bump: patch] [✅ Stable release]
+        │
+        ▼
+  ┌─────────────┐     ┌──────────────────┐     ┌─────────────────────┐
+  │ CI: Build   │────>│ CI: Bump PR      │────>│ Merge bump PR       │
+  │ 3 images    │     │ 0.2.1            │     │ → publishes stable  │
+  └─────────────┘     └──────────────────┘     └─────────────────────┘
+                                                        │
+        ┌───────────────────────────────────────────────┘
+        ▼
+  helm install ...                               (gets 0.2.1 🎉)
+```
 
 ## Image Tags
 
