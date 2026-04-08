@@ -20,8 +20,8 @@ data:
 
     [agent]
     command = "{{ $cfg.command }}"
-    args = {{ $cfg.args | toJson }}
-    working_dir = "{{ $cfg.workingDir }}"
+    args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
+    working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
     {{- if $cfg.env }}
     env = { {{ range $k, $v := $cfg.env }}{{ $k }} = "{{ $v }}", {{ end }} }
     {{- end }}

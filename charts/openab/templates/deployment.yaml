@@ -45,7 +45,7 @@ spec:
                   key: discord-bot-token
             {{- end }}
             - name: HOME
-              value: {{ $cfg.workingDir }}
+              value: {{ $cfg.workingDir | default "/home/agent" }}
             {{- range $k, $v := $cfg.env }}
             - name: {{ $k }}
               value: {{ $v | quote }}
@@ -64,11 +64,11 @@ spec:
               readOnly: true
             {{- if $pvcEnabled }}
             - name: data
-              mountPath: {{ $cfg.workingDir }}
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}
             {{- end }}
             {{- if $cfg.agentsMd }}
             - name: config
-              mountPath: {{ $cfg.workingDir }}/AGENTS.md
+              mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
               subPath: AGENTS.md
             {{- end }}
       {{- with $cfg.nodeSelector }}
