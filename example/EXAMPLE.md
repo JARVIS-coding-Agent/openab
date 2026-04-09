@@ -29,6 +29,15 @@ example/
 docker-compose up -d
 ```
 
+## 認證登入
+### kiro
+```bash
+docker-compose exec -it kiro kiro-cli login --use-device-flow
+```
+### Claude
+```bash
+docker-compose exec -it claude setup-token
+```
 ## 停止服務
 
 ```bash
