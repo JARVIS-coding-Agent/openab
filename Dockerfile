@@ -38,6 +38,6 @@ COPY --from=builder --chown=agent:agent /build/target/release/openab /usr/local/
 
 USER agent
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-  CMD pgrep -x openab || exit 1
+  CMD curl -sf http://localhost:18789/health || exit 1
 ENTRYPOINT ["openab"]
 CMD ["/etc/openab/config.toml"]

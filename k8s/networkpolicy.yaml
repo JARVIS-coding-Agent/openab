@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: openab-network-policy
+spec:
+  podSelector:
+    matchLabels:
+      app: openab
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: 18789
+          protocol: TCP
+  egress:
+    # DNS
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # HTTPS (Discord API, LLM APIs)
+    - ports:
+        - port: 443
+          protocol: TCP
