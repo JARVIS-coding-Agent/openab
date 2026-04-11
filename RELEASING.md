@@ -2,39 +2,43 @@
 
 ## Version Scheme
 
-Versions follow SemVer (e.g. `0.7.0`)。tagpr 根據 PR label 自動決定版本號：
+Versions follow SemVer (e.g. `0.7.0`). Version bumps are controlled via `workflow_dispatch`:
 
-| Label | 效果 | 範例 |
+| Method | 效果 | 範例 |
 |---|---|---|
-| （無） | patch bump | `0.6.0 → 0.6.1` |
-| `tagpr:minor` | minor bump | `0.6.0 → 0.7.0` |
-| `tagpr:major` | major bump | `0.6.0 → 1.0.0` |
+| Auto patch (default) | patch bump + rc | `0.6.0 → 0.6.1-rc.1` |
+| Auto minor | minor bump + rc | `0.6.0 → 0.7.0-rc.1` |
+| Auto major | major bump + rc | `0.6.0 → 1.0.0-rc.1` |
+| Manual | 自行指定 | `0.8.0-rc.1` or `0.8.0` |
 
 ## Release Flow (Tag-Driven)
 
 > **核心原則：測過什麼就發什麼 (what you tested is what you ship)**
 > stable release 不重新 build，直接 promote pre-release 驗證過的 image。
 
-##### Step 1 — 累積變更
+##### Step 1 — 建立 Release PR
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
-  │ 貢獻者 PR merge to main                                          │
-  │ → tagpr.yml 觸發                                                │
-  │ → tagpr 累積 commits，自動開 Release PR                           │
-  │   (更新 Cargo.toml + Chart.yaml version/appVersion + CHANGELOG)  │
+  │ Maintainer 到 Actions → Release PR → Run workflow                │
+  │                                                                  │
+  │   選項 A: 留空 version，選 bump type → 自動算 (e.g. 0.7.0-rc.1) │
+  │   選項 B: 手動填 version (e.g. 0.8.0-rc.1 or 0.8.0)            │
+  │                                                                  │
+  │ → release-pr.yml 觸發                                            │
+  │ → 更新 Cargo.toml + Chart.yaml version/appVersion               │
+  │ → 建立 Release PR (branch: release/v0.7.0-rc.1)                 │
   └─────────────────────────────────────────────────────────────────┘
 ```
 
-##### Step 2 — Pre-release Build & 測試
+##### Step 2 — Merge Release PR → 自動打 Tag → Build
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
-  │ 針對要測試的 commit 打 pre-release tag：                           │
+  │ Maintainer review & merge Release PR                             │
   │                                                                  │
-  │   git tag v0.7.0-rc.1                                            │
-  │   git push origin v0.7.0-rc.1                                   │
-  │                                                                  │
+  │ → tag-on-merge.yml 偵測 release/ branch merge                   │
+  │ → 自動打 tag (e.g. v0.7.0-rc.1)                                 │
   │ → build.yml 觸發 (is_prerelease=true)                            │
   │ → build-image:    4 variants × 2 platforms (amd64 + arm64)      │
   │ → merge-manifests: image tags = <sha> + 0.7.0-rc.1              │
@@ -49,16 +53,19 @@ Versions follow SemVer (e.g. `0.7.0`)。tagpr 根據 PR label 自動決定版本
   │     oci://ghcr.io/openabdev/charts/openab \                      │
   │     --version 0.7.0-rc.1                                         │
   │                                                                  │
-  │ 發現 bug？→ 修復 PR merge → 打 v0.7.0-rc.2 → 重新測試            │
+  │ 發現 bug？→ 修復 PR merge → 再跑一次 Release PR workflow          │
+  │   → 手動指定 v0.7.0-rc.2 → merge → 重新測試                      │
   └─────────────────────────────────────────────────────────────────┘
 ```
 
-##### Step 3 — 測試通過，Merge Release PR
+##### Step 3 — Stable Release（Promote）
 
 ```
   ┌─────────────────────────────────────────────────────────────────┐
-  │ Maintainer merge Release PR                                      │
-  │ → tagpr 自動打 tag (e.g. v0.7.0) + 建立 GitHub Release           │
+  │ 測試通過後，再跑一次 Release PR workflow                           │
+  │ → 手動指定 version: 0.7.0 (不帶 rc)                              │
+  │ → merge Release PR                                               │
+  │ → tag-on-merge.yml 打 tag v0.7.0                                 │
   │                                                                  │
   │ → build.yml 觸發 (is_prerelease=false)                           │
   │ → promote-stable:                                                │
@@ -83,18 +90,20 @@ Versions follow SemVer (e.g. `0.7.0`)。tagpr 根據 PR label 自動決定版本
 ## 快速指令參考
 
 ```bash
-# ── Pre-release（Step 2）──────────────────────────────
-git tag v0.7.0-rc.1
-git push origin v0.7.0-rc.1
+# ── Pre-release ───────────────────────────────────────
+# 到 Actions → Release PR → Run workflow
+# 留空 version，選 patch → 自動算 0.7.0-rc.1
+# 或手動填 version: 0.7.0-rc.1
+# → merge 產生的 Release PR → 自動打 tag → build
 
 # ── 第二輪 pre-release（rc.1 有 bug 時）─────────────
-# 修 bug → PR merge to main → 打新 rc tag
-git tag v0.7.0-rc.2
-git push origin v0.7.0-rc.2
+# 修 bug → PR merge to main
+# 再跑 Release PR workflow，手動填 version: 0.7.0-rc.2
+# → merge → 自動打 tag → build
 
-# ── Stable release（Step 3）───────────────────────────
-# 直接在 GitHub merge tagpr 的 Release PR 即可
-# tagpr 自動打 v0.7.0 tag → promote 最新的 rc image
+# ── Stable release ────────────────────────────────────
+# 跑 Release PR workflow，手動填 version: 0.7.0
+# → merge → 自動打 tag → promote rc image (不 rebuild)
 
 # ── 手動重跑（build 失敗時）──────────────────────────
 gh workflow run build.yml -f tag=v0.7.0-rc.1
@@ -103,30 +112,29 @@ gh workflow run build.yml -f tag=v0.7.0
 
 ## GitHub Releases
 
-每次 release 會產生兩個 GitHub Release：
-
 | Release | Tag 格式 | 內容 |
 |---|---|---|
-| tagpr | `v0.7.0` | CHANGELOG（自動從 commits 產生） |
 | chart-releaser | `openab-0.7.0` | Version Info + Installation instructions |
 
 ## Workflow 對應表
 
 | Workflow | 觸發條件 | 用途 |
 |---|---|---|
-| `tagpr.yml` | push to main | 自動開 Release PR、打 tag、建立 GitHub Release |
-| `build.yml` | tag push `v*` | pre-release: 完整 build / stable: promote pre-release image |
-| `release.yml` | Chart.yaml 變更 push to main | chart-releaser 更新 GitHub Pages index + install instructions |
+| `ci.yml` | pull_request (src/Cargo/Dockerfile) | cargo check + clippy + test |
+| `release-pr.yml` | workflow_dispatch | 建立 Release PR（更新版本檔案） |
+| `tag-on-merge.yml` | release/ PR merge to main | 自動打 tag |
+| `build.yml` | tag push `v*` | pre-release: 完整 build / stable: promote |
+| `release.yml` | Chart.yaml 變更 push to main | chart-releaser 更新 GitHub Pages index |
 
-## Version 同步 (tagpr)
+## Version 同步
 
-tagpr 在 Release PR 中自動更新以下檔案的版本：
+release-pr.yml 在 Release PR 中自動更新以下檔案的版本：
 
-| 檔案 | 欄位 | 更新方式 |
-|---|---|---|
-| `Cargo.toml` | `version` | tagpr 內建 (`versionFile`) |
-| `charts/openab/Chart.yaml` | `version` | tagpr 內建 (`versionFile`) |
-| `charts/openab/Chart.yaml` | `appVersion` | `postVersionCommand` |
+| 檔案 | 欄位 |
+|---|---|
+| `Cargo.toml` | `version` |
+| `charts/openab/Chart.yaml` | `version` |
+| `charts/openab/Chart.yaml` | `appVersion` |
 
 三者統一為同一個 semver（e.g. `0.7.0`）。
 
@@ -170,25 +178,19 @@ helm install openab oci://ghcr.io/openabdev/charts/openab --version 0.7.0
 
 | 時機 | 做什麼 |
 |---|---|
-| tagpr 開 Release PR 後 | Review 版本號 / CHANGELOG |
-| 需要調整版本升級幅度 | 在 Release PR 加 `tagpr:minor` 或 `tagpr:major` label |
-| Pre-release | `git tag v0.7.0-rc.1 && git push origin v0.7.0-rc.1` |
-| 測試通過 | Merge Release PR（tagpr 打 stable tag → 自動 promote） |
+| 準備 release | Actions → Release PR → Run workflow |
+| 需要 rc 測試 | 指定 version 如 `0.7.0-rc.1` |
+| 測試通過 | 指定 stable version 如 `0.7.0` → promote |
 | build 失敗或需重跑 | `gh workflow run build.yml -f tag=<tag>` |
 
 ## GitHub App 權限
 
-tagpr 使用 GitHub App token 來推送 tag 和建立 Release PR。App 需要以下 Repository permissions：
+release-pr.yml 和 tag-on-merge.yml 使用 GitHub App token 來建立 PR 和推送 tag。App 需要以下 Repository permissions：
 
 | Permission | Access |
 |---|---|
-| Actions | Read and write |
-| Commit statuses | Read-only |
 | Contents | Read and write |
-| Issues | Read and write |
-| Merge queues | Read and write |
 | Metadata | Read-only (mandatory) |
-| Packages | Read and write |
 | Pull requests | Read and write |
 
 對應的 secrets：`APP_ID`（Client ID）、`APP_PRIVATE_KEY`。
