@@ -72,6 +72,8 @@ spec:
               mountPath: {{ $cfg.workingDir | default "/home/agent" }}/AGENTS.md
               subPath: AGENTS.md
             {{- end }}
+            - name: tmp
+              mountPath: /tmp
       {{- with $cfg.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
@@ -93,5 +95,7 @@ spec:
           persistentVolumeClaim:
             claimName: {{ include "openab.agentFullname" $d }}
         {{- end }}
+        - name: tmp
+          emptyDir: {}
 {{- end }}
 {{- end }}
