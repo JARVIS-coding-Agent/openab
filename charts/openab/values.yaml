@@ -47,6 +47,8 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
+    #   # ⚠️ When set, this ConfigMap mount shadows any file at the same path on the PVC.
+    #   # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     #   agentsMd: ""
     #   resources: {}
     #   nodeSelector: {}
@@ -77,6 +79,8 @@ agents:
     #     enabled: true
     #     storageClass: ""
     #     size: 1Gi
+    #   # ⚠️ When set, this ConfigMap mount shadows any file at the same path on the PVC.
+    #   # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     #   agentsMd: ""
     #   resources: {}
     #   image: "ghcr.io/openabdev/openab-opencode:latest"
@@ -115,6 +119,8 @@ agents:
       enabled: true
       storageClass: ""
       size: 1Gi  # defaults to 1Gi if not set
+    # ⚠️ When set, this ConfigMap mount shadows any file at the same path on the PVC.
+    # The PVC file is NOT deleted but becomes invisible to the agent. Remove agentsMd to restore.
     agentsMd: ""
     resources: {}
     nodeSelector: {}
