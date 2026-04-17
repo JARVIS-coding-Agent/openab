@@ -29,7 +29,7 @@ data:
     {{- if not (has $cfg.discord.allowBotMessages (list "off" "mentions" "all")) }}
     {{- fail (printf "agents.%s.discord.allowBotMessages must be one of: off, mentions, all — got: %s" $name $cfg.discord.allowBotMessages) }}
     {{- end }}
-    allow_bot_messages = "{{ $cfg.discord.allowBotMessages }}"
+    allow_bot_messages = {{ $cfg.discord.allowBotMessages | toJson }}
     {{- end }}
     {{- range $cfg.discord.trustedBotIds }}
     {{- if regexMatch "e\\+|E\\+" (toString .) }}
@@ -64,7 +64,7 @@ data:
     {{- if not (has ($cfg.slack).allowBotMessages (list "off" "mentions" "all")) }}
     {{- fail (printf "agents.%s.slack.allowBotMessages must be one of: off, mentions, all — got: %s" $name ($cfg.slack).allowBotMessages) }}
     {{- end }}
-    allow_bot_messages = "{{ ($cfg.slack).allowBotMessages }}"
+    allow_bot_messages = {{ ($cfg.slack).allowBotMessages | toJson }}
     {{- end }}
     {{- if ($cfg.slack).trustedBotIds }}
     trusted_bot_ids = {{ ($cfg.slack).trustedBotIds | toJson }}
@@ -73,16 +73,16 @@ data:
     {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions")) }}
     {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions — got: %s" $name ($cfg.slack).allowUserMessages) }}
     {{- end }}
-    allow_user_messages = "{{ ($cfg.slack).allowUserMessages }}"
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}
     {{- end }}
     {{- end }}
 
     [agent]
-    command = "{{ $cfg.command }}"
+    command = {{ $cfg.command | toJson }}
     args = {{ if $cfg.args }}{{ $cfg.args | toJson }}{{ else }}[]{{ end }}
-    working_dir = "{{ $cfg.workingDir | default "/home/agent" }}"
+    working_dir = {{ $cfg.workingDir | default "/home/agent" | toJson }}
     {{- if $cfg.env }}
-    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = "{{ $v }}"{{ $first = false }}{{ end }} }
+    env = { {{ $first := true }}{{ range $k, $v := $cfg.env }}{{ if not $first }}, {{ end }}{{ $k }} = {{ $v | toJson }}{{ $first = false }}{{ end }} }
     {{- end }}
 
     [pool]
@@ -100,8 +100,8 @@ data:
     [stt]
     enabled = true
     api_key = "${STT_API_KEY}"
-    model = "{{ ($cfg.stt).model | default "whisper-large-v3-turbo" }}"
-    base_url = "{{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" }}"
+    model = {{ ($cfg.stt).model | default "whisper-large-v3-turbo" | toJson }}
+    base_url = {{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" | toJson }}
     {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
