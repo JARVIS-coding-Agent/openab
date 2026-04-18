@@ -42,11 +42,12 @@ data:
     {{- if $cfg.discord.trustedBotIds }}
     trusted_bot_ids = {{ $cfg.discord.trustedBotIds | toJson }}
     {{- end }}
+    {{- /* allowUserMessages: controls whether the bot requires @mention in threads (Discord) */ -}}
     {{- if $cfg.discord.allowUserMessages }}
     {{- if not (has $cfg.discord.allowUserMessages (list "involved" "mentions")) }}
     {{- fail (printf "agents.%s.discord.allowUserMessages must be one of: involved, mentions — got: %s" $name $cfg.discord.allowUserMessages) }}
     {{- end }}
-    allow_user_messages = "{{ $cfg.discord.allowUserMessages }}"
+    allow_user_messages = {{ $cfg.discord.allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention */ -}}
     {{- end }}
     {{- end }}
 
@@ -79,7 +80,7 @@ data:
     {{- if not (has ($cfg.slack).allowUserMessages (list "involved" "mentions")) }}
     {{- fail (printf "agents.%s.slack.allowUserMessages must be one of: involved, mentions — got: %s" $name ($cfg.slack).allowUserMessages) }}
     {{- end }}
-    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}
+    allow_user_messages = {{ ($cfg.slack).allowUserMessages | toJson }}  {{- /* involved (default): respond in bot's threads without @mention | mentions: always require @mention */ -}}
     {{- end }}
     {{- end }}
 
