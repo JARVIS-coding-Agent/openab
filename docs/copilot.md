@@ -90,6 +90,29 @@ The `gh` token is stored under `~/.config/gh/` on the PVC and persists across po
 
 ### Summary
 
+```
+Scenario 1: Same user for both (simple)
+┌─────────────────────────────────────────────────────────┐
+│  copilot login (as @alice)                              │
+│    ├─ Copilot subscription ── @alice's plan ✅          │
+│    └─ gh operations ───────── @alice ✅                 │
+│                                                         │
+│  No env var needed. One login covers everything.        │
+└─────────────────────────────────────────────────────────┘
+
+Scenario 2: Different users (split auth)
+┌─────────────────────────────────────────────────────────┐
+│  COPILOT_GITHUB_TOKEN=github_pat_... (from @alice)      │
+│    └─ Copilot subscription ── @alice's plan ✅          │
+│                                                         │
+│  gh auth login (as @bot-user)                           │
+│    └─ gh operations ───────── @bot-user ✅              │
+│                                                         │
+│  Use when subscription owner ≠ git operations user.     │
+│  e.g. @alice owns Copilot Pro, @bot-user pushes code.   │
+└─────────────────────────────────────────────────────────┘
+```
+
 | Auth Layer | Purpose | Account | Method |
 |---|---|---|---|
 | `COPILOT_GITHUB_TOKEN` | Copilot subscription (models) | Subscription owner | Fine-grained PAT env var |
