@@ -1,5 +1,7 @@
 use crate::acp::ContentBlock;
+use crate::acp::protocol::ConfigOption;
 use crate::adapter::{AdapterRouter, ChatAdapter, ChannelRef, MessageRef, SenderContext};
+use crate::bot_turns::{BotTurnTracker, TurnResult, HARD_BOT_TURN_LIMIT};
 use crate::config::{AllowBots, AllowUsers, SttConfig};
 use crate::media;
 use anyhow::{anyhow, Result};
@@ -61,6 +63,9 @@ pub struct SlackAdapter {
     bot_id_cache: tokio::sync::Mutex<HashMap<String, String>>,
     /// Positive-only cache: thread_ts → cached_at for threads where bot has participated.
     participated_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
+    /// Positive-only cache: thread_ts → cached_at for threads where other bots have posted.
+    /// Like participation, a thread becoming multi-bot is irreversible (bot messages don't disappear).
+    multibot_threads: tokio::sync::Mutex<HashMap<String, tokio::time::Instant>>,
     /// TTL for participation cache entries (matches session_ttl_hours from config).
     session_ttl: std::time::Duration,
     /// Controls streaming behavior: Off → streaming edit, Mentions/All → send-once.
@@ -76,8 +81,29 @@ impl SlackAdapter {
             user_cache: tokio::sync::Mutex::new(HashMap::new()),
             bot_id_cache: tokio::sync::Mutex::new(HashMap::new()),
             participated_threads: tokio::sync::Mutex::new(HashMap::new()),
+            multibot_threads: tokio::sync::Mutex::new(HashMap::new()),
             session_ttl,
             allow_bot_messages,
+        }
+    }
+
+    /// Eagerly record that another bot has posted in a thread. Called from the
+    /// event loop when a bot message arrives, so multibot detection doesn't
+    /// depend on fetching thread history. Idempotent.
+    async fn note_other_bot_in_thread(&self, thread_ts: &str) {
+        let mut cache = self.multibot_threads.lock().await;
+        cache.entry(thread_ts.to_string()).or_insert_with(tokio::time::Instant::now);
+        enforce_cache_bounds(&mut cache, self.session_ttl);
+    }
+
+    /// POST a JSON body to a Slack `response_url` (slash command / interactive callback).
+    /// Slack accepts this without the bot token — the URL itself is the auth.
+    async fn post_response_url(&self, response_url: &str, body: &serde_json::Value) {
+        if response_url.is_empty() {
+            return;
+        }
+        if let Err(e) = self.client.post(response_url).json(body).send().await {
+            warn!(error = %e, "failed to post to response_url");
         }
     }
 
@@ -201,26 +227,33 @@ impl SlackAdapter {
         Some(user_id)
     }
 
-    /// Check if the bot has participated in a Slack thread.
-    /// Returns true if: parent message @mentions the bot, OR any message in thread is from the bot.
-    /// Fail-closed: returns false on API error (consistent with Discord's approach).
-    /// Only caches positive results (involved=true is irreversible).
-    async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> bool {
-        // Check positive cache first
-        {
+    /// Check whether the bot has participated in a Slack thread and whether
+    /// other bots have also posted in it.
+    /// Returns `(involved, other_bot_present)`.
+    /// Involved = parent message @mentions the bot OR any message in thread is from the bot.
+    /// Fail-closed: returns `(false, false)` on API error (consistent with Discord's approach).
+    /// Caches positive results only — both states are irreversible.
+    async fn bot_participated_in_thread(&self, channel: &str, thread_ts: &str) -> (bool, bool) {
+        let cached_involved = {
             let cache = self.participated_threads.lock().await;
-            if let Some(cached_at) = cache.get(thread_ts) {
-                if cached_at.elapsed() < self.session_ttl {
-                    return true;
-                }
-            }
+            cache.get(thread_ts).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
+        let cached_multibot = {
+            let cache = self.multibot_threads.lock().await;
+            cache.get(thread_ts).is_some_and(|ts| ts.elapsed() < self.session_ttl)
+        };
+
+        // Eager multibot detection from message events populates the cache
+        // before this runs. When already involved and cached, skip the fetch.
+        if cached_involved {
+            return (true, cached_multibot);
         }
 
         let bot_id = match self.get_bot_user_id().await {
             Some(id) => id,
             None => {
                 warn!("cannot resolve bot user ID, rejecting (fail-closed)");
-                return false;
+                return (false, false);
             }
         };
 
@@ -240,49 +273,60 @@ impl SlackAdapter {
             Ok(json) => json,
             Err(e) => {
                 warn!(channel, thread_ts, error = %e, "failed to fetch thread replies, rejecting (fail-closed)");
-                return false;
+                return (false, false);
             }
         };
-        let Some(messages) = json["messages"].as_array() else { return false };
+        let Some(messages) = json["messages"].as_array() else { return (false, false) };
 
-        // Check if parent message @mentions the bot
         let parent_mentions_bot = messages
             .first()
             .and_then(|m| m["text"].as_str())
             .is_some_and(|text| text.contains(&format!("<@{bot_id}>")));
 
-        // Check if any message in thread is from the bot
         let bot_posted = messages.iter().any(|m| m["user"].as_str() == Some(bot_id));
 
         let involved = parent_mentions_bot || bot_posted;
+        let other_bot_present = cached_multibot
+            || messages.iter().any(|m| {
+                let is_bot_msg = m["bot_id"].is_string()
+                    || m["subtype"].as_str() == Some("bot_message");
+                is_bot_msg && m["user"].as_str() != Some(bot_id)
+            });
 
         if involved {
             self.cache_participation(thread_ts).await;
         }
+        if other_bot_present && !cached_multibot {
+            self.note_other_bot_in_thread(thread_ts).await;
+        }
 
-        involved
+        (involved, other_bot_present)
     }
 
     /// Insert a positive participation entry, enforcing cache bounds.
     async fn cache_participation(&self, thread_ts: &str) {
         let mut cache = self.participated_threads.lock().await;
-        let now = tokio::time::Instant::now();
+        cache.insert(thread_ts.to_string(), tokio::time::Instant::now());
+        enforce_cache_bounds(&mut cache, self.session_ttl);
+    }
+}
 
-        cache.insert(thread_ts.to_string(), now);
-
-        if cache.len() > PARTICIPATION_CACHE_MAX {
-            // Evict expired entries first
-            cache.retain(|_, ts| ts.elapsed() < self.session_ttl);
-
-            // If still over, evict oldest half
-            if cache.len() > PARTICIPATION_CACHE_MAX {
-                let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
-                entries.sort_by_key(|(_, ts)| *ts);
-                let evict_count = entries.len() / 2;
-                for (key, _) in entries.into_iter().take(evict_count) {
-                    cache.remove(&key);
-                }
-            }
+/// Shared eviction policy for positive-only caches.
+/// First drops expired entries; if still over, drops the oldest half.
+fn enforce_cache_bounds(
+    cache: &mut HashMap<String, tokio::time::Instant>,
+    ttl: std::time::Duration,
+) {
+    if cache.len() <= PARTICIPATION_CACHE_MAX {
+        return;
+    }
+    cache.retain(|_, ts| ts.elapsed() < ttl);
+    if cache.len() > PARTICIPATION_CACHE_MAX {
+        let mut entries: Vec<_> = cache.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        entries.sort_by_key(|(_, ts)| *ts);
+        let evict_count = entries.len() / 2;
+        for (key, _) in entries.into_iter().take(evict_count) {
+            cache.remove(&key);
         }
     }
 }
@@ -454,6 +498,7 @@ pub async fn run_slack_adapter(
     allow_bot_messages: AllowBots,
     trusted_bot_ids: HashSet<String>,
     allow_user_messages: AllowUsers,
+    max_bot_turns: u32,
     session_ttl: std::time::Duration,
     stt_config: SttConfig,
     router: Arc<AdapterRouter>,
@@ -461,6 +506,7 @@ pub async fn run_slack_adapter(
 ) -> Result<()> {
     let adapter = Arc::new(SlackAdapter::new(bot_token.clone(), session_ttl, allow_bot_messages));
     let queue = Arc::new(KeyedAsyncQueue::new());
+    let bot_turns = Arc::new(tokio::sync::Mutex::new(BotTurnTracker::new(max_bot_turns)));
 
     loop {
         // Check for shutdown before (re)connecting
@@ -502,6 +548,28 @@ pub async fn run_slack_adapter(
                                         let _ = write
                                             .send(tungstenite::Message::Text(ack.to_string()))
                                             .await;
+                                    }
+
+                                    // Slash commands (/models, /agents, /cancel)
+                                    if envelope["type"].as_str() == Some("slash_commands") {
+                                        let payload = envelope["payload"].clone();
+                                        let adapter = adapter.clone();
+                                        let router = router.clone();
+                                        tokio::spawn(async move {
+                                            handle_slash_command(&adapter, &router, &payload).await;
+                                        });
+                                        continue;
+                                    }
+
+                                    // Interactive components (select menu selections)
+                                    if envelope["type"].as_str() == Some("interactive") {
+                                        let payload = envelope["payload"].clone();
+                                        let adapter = adapter.clone();
+                                        let router = router.clone();
+                                        tokio::spawn(async move {
+                                            handle_interactive(&adapter, &router, &payload).await;
+                                        });
+                                        continue;
                                     }
 
                                     // Route events
@@ -551,7 +619,6 @@ pub async fn run_slack_adapter(
                                                     let Some(_permit) = queue.acquire(&queue_key).await else { return };
                                                     handle_message(
                                                         &event,
-                                                        true,
                                                         &adapter,
                                                         &bot_token,
                                                         allow_all_channels,
@@ -571,12 +638,15 @@ pub async fn run_slack_adapter(
                                                     || event["subtype"].as_str() == Some("bot_message");
                                                 let subtype = event["subtype"].as_str().unwrap_or("");
                                                 let msg_text = event["text"].as_str().unwrap_or("");
-                                                let mentions_bot = if let Some(bot_uid) = adapter.get_bot_user_id().await {
-                                                    msg_text.contains(&format!("<@{bot_uid}>"))
-                                                } else {
-                                                    false
-                                                };
+                                                let bot_uid_opt = adapter.get_bot_user_id().await.map(|s| s.to_string());
+                                                let mentions_bot = bot_uid_opt
+                                                    .as_ref()
+                                                    .is_some_and(|bot_uid| msg_text.contains(&format!("<@{bot_uid}>")));
                                                 let is_dm = channel_id.starts_with('D');
+                                                let event_user_id = event["user"].as_str();
+                                                let is_own_bot_msg = is_bot
+                                                    && bot_uid_opt.as_deref().is_some()
+                                                    && event_user_id == bot_uid_opt.as_deref();
 
                                                 debug!(
                                                     channel_id,
@@ -596,6 +666,74 @@ pub async fn run_slack_adapter(
                                                     "channel_topic" | "channel_purpose"
                                                 );
                                                 if skip_subtype { continue; }
+
+                                                // --- Eager multibot detection ---
+                                                // Runs before self-check and bot gating so we always detect
+                                                // other bots even when allow_bot_messages=Off filters them out.
+                                                // Matches Discord #481 ordering.
+                                                if is_bot && !is_own_bot_msg {
+                                                    if let Some(thread_ts) = event["thread_ts"].as_str() {
+                                                        adapter.note_other_bot_in_thread(thread_ts).await;
+                                                    }
+                                                }
+
+                                                // --- Bot turn tracking ---
+                                                // Runs before self-check so ALL bot messages (including own)
+                                                // count toward the per-thread limit. Matches Discord #483.
+                                                // Keyed on thread_ts when in a thread, else channel:ts (the
+                                                // same key shape used for per-thread queueing below).
+                                                let turn_key = if let Some(thread_ts) = event["thread_ts"].as_str() {
+                                                    thread_ts.to_string()
+                                                } else {
+                                                    format!("{}:{}", channel_id, event["ts"].as_str().unwrap_or(""))
+                                                };
+                                                {
+                                                    let mut tracker = bot_turns.lock().await;
+                                                    if is_bot {
+                                                        match tracker.on_bot_message(&turn_key) {
+                                                            TurnResult::HardLimit => {
+                                                                warn!(channel_id, "hard bot turn limit reached");
+                                                                if !is_own_bot_msg {
+                                                                    let warn_channel = ChannelRef {
+                                                                        platform: "slack".into(),
+                                                                        channel_id: channel_id.to_string(),
+                                                                        thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+                                                                        parent_id: None,
+                                                                    };
+                                                                    let _ = adapter.send_message(
+                                                                        &warn_channel,
+                                                                        &format!("🛑 Hard bot turn limit reached ({HARD_BOT_TURN_LIMIT}). A human must reply to continue."),
+                                                                    ).await;
+                                                                }
+                                                                continue;
+                                                            }
+                                                            TurnResult::Stopped => continue,
+                                                            TurnResult::SoftLimit(n) => {
+                                                                info!(channel_id, turns = n, max = max_bot_turns, "soft bot turn limit reached");
+                                                                if !is_own_bot_msg {
+                                                                    let warn_channel = ChannelRef {
+                                                                        platform: "slack".into(),
+                                                                        channel_id: channel_id.to_string(),
+                                                                        thread_id: event["thread_ts"].as_str().map(|s| s.to_string()),
+                                                                        parent_id: None,
+                                                                    };
+                                                                    let _ = adapter.send_message(
+                                                                        &warn_channel,
+                                                                        &format!("⚠️ Bot turn limit reached ({n}/{max_bot_turns}). A human must reply in this thread to continue bot-to-bot conversation."),
+                                                                    ).await;
+                                                                }
+                                                                continue;
+                                                            }
+                                                            TurnResult::Throttled => continue,
+                                                            TurnResult::Ok => {}
+                                                        }
+                                                    } else {
+                                                        tracker.on_human_message(&turn_key);
+                                                    }
+                                                }
+
+                                                // Ignore own bot messages (after counting toward turns)
+                                                if is_own_bot_msg { continue; }
 
                                                 // Skip messages that @mention the bot — app_mention handles those
                                                 // (except in DMs where app_mention doesn't fire)
@@ -668,16 +806,33 @@ pub async fn run_slack_adapter(
                                                             AllowUsers::Mentions => {
                                                                 if !mentions_bot { continue; }
                                                             }
-                                                            AllowUsers::Involved | AllowUsers::MultibotMentions => {
+                                                            AllowUsers::Involved => {
                                                                 if !has_thread {
-                                                                    // Non-thread channel message: require mention
-                                                                    // (app_mention handles this, but DMs don't get app_mention)
                                                                     continue;
                                                                 }
-                                                                // Thread message: check bot participation
                                                                 let thread_ts = event["thread_ts"].as_str().unwrap_or("");
-                                                                if !adapter.bot_participated_in_thread(channel_id, thread_ts).await {
+                                                                let (involved, _) = adapter
+                                                                    .bot_participated_in_thread(channel_id, thread_ts)
+                                                                    .await;
+                                                                if !involved {
                                                                     debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    continue;
+                                                                }
+                                                            }
+                                                            AllowUsers::MultibotMentions => {
+                                                                if !has_thread {
+                                                                    continue;
+                                                                }
+                                                                let thread_ts = event["thread_ts"].as_str().unwrap_or("");
+                                                                let (involved, other_bot) = adapter
+                                                                    .bot_participated_in_thread(channel_id, thread_ts)
+                                                                    .await;
+                                                                if !involved {
+                                                                    debug!(channel_id, thread_ts, "bot not involved in thread, ignoring");
+                                                                    continue;
+                                                                }
+                                                                if other_bot {
+                                                                    debug!(channel_id, thread_ts, "multi-bot thread, requiring @mention");
                                                                     continue;
                                                                 }
                                                             }
@@ -708,7 +863,6 @@ pub async fn run_slack_adapter(
                                                     let Some(_permit) = queue.acquire(&queue_key).await else { return };
                                                     handle_message(
                                                         &event,
-                                                        is_dm,
                                                         &adapter,
                                                         &bot_token,
                                                         allow_all_channels,
@@ -780,7 +934,6 @@ async fn get_socket_mode_url(app_token: &str) -> Result<String> {
 #[allow(clippy::too_many_arguments)]
 async fn handle_message(
     event: &serde_json::Value,
-    strip_mentions: bool,
     adapter: &Arc<SlackAdapter>,
     bot_token: &str,
     allow_all_channels: bool,
@@ -832,12 +985,10 @@ async fn handle_message(
         return;
     }
 
-    // Strip bot mention from text for @mention events; DMs and thread follow-ups pass through as-is
-    let prompt = if strip_mentions {
-        strip_slack_mention(&text)
-    } else {
-        text.trim().to_string()
-    };
+    // Resolve mentions: strip only this bot's own trigger mention so the LLM
+    // can still @-mention other users in its reply.
+    let bot_id = adapter.get_bot_user_id().await;
+    let prompt = resolve_slack_mentions(&text, bot_id);
 
     // Process file attachments (images, audio)
     let files = event["files"].as_array();
@@ -960,11 +1111,225 @@ async fn handle_message(
     }
 }
 
-static SLACK_MENTION_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"<@[A-Z0-9]+>").unwrap());
+// --- Slash commands & interactive blocks ---
 
-fn strip_slack_mention(text: &str) -> String {
-    SLACK_MENTION_RE.replace_all(text, "").trim().to_string()
+/// Dispatch an incoming Slack slash command payload.
+/// Commands handled: `/models` / `/model`, `/agents` / `/agent`, `/cancel`.
+/// Users configure the actual command names in the Slack App dashboard; this
+/// just matches whatever shape comes in.
+async fn handle_slash_command(
+    adapter: &SlackAdapter,
+    router: &AdapterRouter,
+    payload: &serde_json::Value,
+) {
+    let command = payload["command"].as_str().unwrap_or("");
+    let channel_id = payload["channel_id"].as_str().unwrap_or("");
+    let response_url = payload["response_url"].as_str().unwrap_or("");
+    if response_url.is_empty() || channel_id.is_empty() {
+        return;
+    }
+
+    // Slack slash commands carry channel context but not thread context in
+    // the payload. Key sessions by channel — matches how non-thread messages
+    // are keyed. Thread-scoped config switching would require a separate UX.
+    let thread_key = format!("slack:{channel_id}");
+
+    let body = match command {
+        "/models" | "/model" => {
+            build_config_response(router, &thread_key, "model", "model").await
+        }
+        "/agents" | "/agent" => {
+            build_config_response(router, &thread_key, "agent", "agent").await
+        }
+        "/cancel" => build_cancel_response(router, &thread_key).await,
+        other => {
+            debug!(command = other, "unknown slash command, ignoring");
+            return;
+        }
+    };
+
+    adapter.post_response_url(response_url, &body).await;
+}
+
+/// Dispatch an incoming Slack interactive payload (block_actions from our select menus).
+async fn handle_interactive(
+    adapter: &SlackAdapter,
+    router: &AdapterRouter,
+    payload: &serde_json::Value,
+) {
+    if payload["type"].as_str() != Some("block_actions") {
+        return;
+    }
+    let response_url = payload["response_url"].as_str().unwrap_or("");
+    if response_url.is_empty() {
+        return;
+    }
+    let action = match payload["actions"].as_array().and_then(|a| a.first()) {
+        Some(a) => a,
+        None => return,
+    };
+    let action_id = action["action_id"].as_str().unwrap_or("");
+    let config_id = match action_id.strip_prefix("acp_config_") {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => return,
+    };
+    let selected_value = match action["selected_option"]["value"].as_str() {
+        Some(v) => v.to_string(),
+        None => return,
+    };
+    let channel_id = payload["channel"]["id"].as_str().unwrap_or("");
+    if channel_id.is_empty() {
+        return;
+    }
+    let thread_key = format!("slack:{channel_id}");
+
+    let result = router
+        .pool()
+        .set_config_option(&thread_key, &config_id, &selected_value)
+        .await;
+
+    let text = match result {
+        Ok(updated_options) => {
+            let display_name = updated_options
+                .iter()
+                .find(|o| o.id == config_id)
+                .and_then(|o| o.options.iter().find(|v| v.value == selected_value))
+                .map(|v| v.name.clone())
+                .unwrap_or_else(|| selected_value.clone());
+            format!("✅ Switched to *{display_name}*")
+        }
+        Err(e) => {
+            error!(error = %e, "failed to set config option");
+            format!("❌ Failed to switch: {e}")
+        }
+    };
+
+    let body = serde_json::json!({
+        "response_type": "ephemeral",
+        "replace_original": true,
+        "text": text,
+    });
+    adapter.post_response_url(response_url, &body).await;
+}
+
+/// Build an ephemeral slash-command response containing a select menu populated
+/// from the ACP session's configOptions.
+async fn build_config_response(
+    router: &AdapterRouter,
+    thread_key: &str,
+    category: &str,
+    label: &str,
+) -> serde_json::Value {
+    let options = router.pool().get_config_options(thread_key).await;
+    match build_select_block(&options, category, label) {
+        Some(block) => serde_json::json!({
+            "response_type": "ephemeral",
+            "text": format!("🔧 Select a {label}:"),
+            "blocks": [block],
+        }),
+        None => serde_json::json!({
+            "response_type": "ephemeral",
+            "text": format!("⚠️ No {label} options available. Start a conversation first by @mentioning the bot."),
+        }),
+    }
+}
+
+/// Build the `/cancel` ephemeral response after attempting to cancel the session.
+async fn build_cancel_response(router: &AdapterRouter, thread_key: &str) -> serde_json::Value {
+    let text = match router.pool().cancel_session(thread_key).await {
+        Ok(()) => "🛑 Cancel signal sent.".to_string(),
+        Err(e) => format!("⚠️ {e}"),
+    };
+    serde_json::json!({
+        "response_type": "ephemeral",
+        "text": text,
+    })
+}
+
+/// Build a Slack `section` block with an attached `static_select` element
+/// from ACP `ConfigOption`s. Returns `None` when no options are available.
+fn build_select_block(options: &[ConfigOption], category: &str, label: &str) -> Option<serde_json::Value> {
+    let opt = options.iter().find(|o| o.category.as_deref() == Some(category))?;
+    if opt.options.is_empty() {
+        return None;
+    }
+
+    let menu_options: Vec<serde_json::Value> = opt
+        .options
+        .iter()
+        .map(|o| {
+            let mut item = serde_json::json!({
+                "text": { "type": "plain_text", "text": truncate(&o.name, 75) },
+                "value": o.value.clone(),
+            });
+            if let Some(desc) = &o.description {
+                let trimmed = truncate(desc, 75);
+                item["description"] = serde_json::json!({"type": "plain_text", "text": trimmed});
+            }
+            item
+        })
+        .collect();
+
+    let initial_option = opt
+        .options
+        .iter()
+        .find(|o| o.value == opt.current_value)
+        .map(|o| {
+            let mut item = serde_json::json!({
+                "text": { "type": "plain_text", "text": truncate(&o.name, 75) },
+                "value": o.value.clone(),
+            });
+            if let Some(desc) = &o.description {
+                item["description"] = serde_json::json!({"type": "plain_text", "text": truncate(desc, 75)});
+            }
+            item
+        });
+
+    let current_label = opt
+        .options
+        .iter()
+        .find(|o| o.value == opt.current_value)
+        .map(|o| o.name.as_str())
+        .unwrap_or(opt.current_value.as_str());
+
+    let mut accessory = serde_json::json!({
+        "type": "static_select",
+        "action_id": format!("acp_config_{}", opt.id),
+        "placeholder": {
+            "type": "plain_text",
+            "text": truncate(&format!("Current: {current_label}"), 150),
+        },
+        "options": menu_options,
+    });
+    if let Some(init) = initial_option {
+        accessory["initial_option"] = init;
+    }
+
+    Some(serde_json::json!({
+        "type": "section",
+        "text": { "type": "mrkdwn", "text": format!("🔧 Select a {label}:") },
+        "accessory": accessory,
+    }))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Strip only the bot's own `<@BOT_UID>` trigger mention.
+/// Other users' mentions stay intact so the LLM can @-mention them back.
+/// If the bot UID isn't known, fall back to returning the text trimmed —
+/// safer than stripping all mentions and losing user addressability.
+fn resolve_slack_mentions(text: &str, bot_id: Option<&str>) -> String {
+    match bot_id {
+        Some(id) => text.replace(&format!("<@{id}>"), "").trim().to_string(),
+        None => text.trim().to_string(),
+    }
 }
 
 /// Convert Markdown (as output by Claude Code) to Slack mrkdwn format.
@@ -989,4 +1354,90 @@ fn markdown_to_mrkdwn(text: &str) -> String {
     let text = HEADING_RE.replace_all(&text, "*$1*");          // # heading → *heading*
     let text = CODE_BLOCK_LANG_RE.replace_all(&text, "```\n"); // ```rust → ```
     text.into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bot's own `<@UID>` trigger mention is stripped.
+    #[test]
+    fn resolve_mentions_strips_bot_mention() {
+        let out = resolve_slack_mentions("<@U1BOT> hello", Some("U1BOT"));
+        assert_eq!(out, "hello");
+    }
+
+    /// Other users' mentions are preserved so the LLM can address them back —
+    /// this is the core fix: the old `strip_slack_mention` wiped all `<@...>`.
+    #[test]
+    fn resolve_mentions_preserves_other_user_mentions() {
+        let out = resolve_slack_mentions("<@U1BOT> say hi to <@U2ALICE>", Some("U1BOT"));
+        assert_eq!(out, "say hi to <@U2ALICE>");
+    }
+
+    /// Multiple occurrences of the bot mention all get stripped.
+    #[test]
+    fn resolve_mentions_strips_repeated_bot_mentions() {
+        let out = resolve_slack_mentions("<@U1BOT> ping <@U1BOT>", Some("U1BOT"));
+        assert_eq!(out, "ping");
+    }
+
+    /// When the bot UID is unknown, fall back to preserving the text
+    /// (safer than stripping all user mentions).
+    #[test]
+    fn resolve_mentions_unknown_bot_preserves_all() {
+        let out = resolve_slack_mentions("<@U1BOT> hi <@U2ALICE>", None);
+        assert_eq!(out, "<@U1BOT> hi <@U2ALICE>");
+    }
+
+    /// `truncate` leaves short strings untouched.
+    #[test]
+    fn truncate_short_is_noop() {
+        assert_eq!(truncate("short", 75), "short");
+    }
+
+    /// `truncate` caps at char count, not byte length — safe for multi-byte UTF-8.
+    #[test]
+    fn truncate_handles_multibyte() {
+        let s: String = "日".repeat(100);
+        let out = truncate(&s, 10);
+        assert_eq!(out.chars().count(), 10);
+        assert!(out.ends_with('…'));
+    }
+
+    /// Static-select builder: returns None when no options exist for the category.
+    #[test]
+    fn build_select_block_empty_returns_none() {
+        let opts: Vec<ConfigOption> = vec![];
+        assert!(build_select_block(&opts, "model", "model").is_none());
+    }
+
+    /// Static-select builder: produces a section+static_select with an action_id
+    /// prefixed `acp_config_` so the interactive handler can route it.
+    #[test]
+    fn build_select_block_action_id_prefix() {
+        use crate::acp::protocol::{ConfigOption, ConfigOptionValue};
+        let opts = vec![ConfigOption {
+            id: "model_v2".into(),
+            name: "Model".into(),
+            description: None,
+            category: Some("model".into()),
+            option_type: "enum".into(),
+            current_value: "a".into(),
+            options: vec![
+                ConfigOptionValue { name: "A".into(), value: "a".into(), description: None },
+                ConfigOptionValue { name: "B".into(), value: "b".into(), description: None },
+            ],
+        }];
+        let block = build_select_block(&opts, "model", "model").expect("block");
+        assert_eq!(
+            block["accessory"]["action_id"].as_str(),
+            Some("acp_config_model_v2")
+        );
+        assert_eq!(block["accessory"]["type"].as_str(), Some("static_select"));
+        assert_eq!(
+            block["accessory"]["options"].as_array().map(|a| a.len()),
+            Some(2)
+        );
+    }
 }

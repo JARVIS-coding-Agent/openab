@@ -1,0 +1,183 @@
+//! Per-thread bot turn tracking for runaway-loop prevention.
+//!
+//! Shared between Discord and Slack adapters so both platforms apply the same
+//! soft/hard limit semantics. Both counters reset on a human message in the
+//! thread. Runs before self-check so a bot's own messages count too — this
+//! means `soft_limit=20` caps the *total* bot messages in a thread, not per-bot.
+
+use std::collections::HashMap;
+
+/// Absolute per-thread cap on bot turns. Cannot be overridden by config or
+/// human intervention within the session's lifetime — a human must intervene
+/// and then a new bot turn can increment again from 0, but the hard counter
+/// also tracks the lifetime total and caps it regardless.
+pub const HARD_BOT_TURN_LIMIT: u32 = 100;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum TurnResult {
+    /// Counter below limits — continue normally.
+    Ok,
+    /// Counter == soft_limit — warn once, then stop.
+    SoftLimit(u32),
+    /// Counter > soft_limit — silently stop (already warned).
+    Throttled,
+    /// Counter == HARD_BOT_TURN_LIMIT — warn once, then stop.
+    HardLimit,
+    /// Counter > HARD_BOT_TURN_LIMIT — silently stop (already warned).
+    Stopped,
+}
+
+pub struct BotTurnTracker {
+    soft_limit: u32,
+    counts: HashMap<String, (u32, u32)>,
+}
+
+impl BotTurnTracker {
+    pub fn new(soft_limit: u32) -> Self {
+        Self { soft_limit, counts: HashMap::new() }
+    }
+
+    pub fn on_bot_message(&mut self, thread_id: &str) -> TurnResult {
+        let (soft, hard) = self.counts.entry(thread_id.to_string()).or_insert((0, 0));
+        *soft += 1;
+        *hard += 1;
+        if *hard > HARD_BOT_TURN_LIMIT {
+            TurnResult::Stopped
+        } else if *hard == HARD_BOT_TURN_LIMIT {
+            TurnResult::HardLimit
+        } else if *soft > self.soft_limit {
+            TurnResult::Throttled
+        } else if *soft == self.soft_limit {
+            TurnResult::SoftLimit(*soft)
+        } else {
+            TurnResult::Ok
+        }
+    }
+
+    pub fn on_human_message(&mut self, thread_id: &str) {
+        if let Some((soft, hard)) = self.counts.get_mut(thread_id) {
+            *soft = 0;
+            *hard = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bot_turns_increment() {
+        let mut t = BotTurnTracker::new(5);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+    }
+
+    #[test]
+    fn soft_limit_triggers() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
+    }
+
+    #[test]
+    fn human_resets_both_counters() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        t.on_human_message("t1");
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
+    }
+
+    #[test]
+    fn hard_limit_triggers() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
+    }
+
+    #[test]
+    fn hard_limit_resets_on_human() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        t.on_human_message("t1");
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+    }
+
+    #[test]
+    fn hard_before_soft_when_equal() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
+    }
+
+    #[test]
+    fn threads_are_independent() {
+        let mut t = BotTurnTracker::new(3);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(3));
+        assert_eq!(t.on_bot_message("t2"), TurnResult::Ok);
+    }
+
+    #[test]
+    fn human_on_unknown_thread_is_noop() {
+        let mut t = BotTurnTracker::new(5);
+        t.on_human_message("unknown");
+    }
+
+    #[test]
+    fn two_bot_pingpong_hits_soft_limit() {
+        let mut t = BotTurnTracker::new(20);
+        for i in 1..20 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok, "turn {i}");
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
+    }
+
+    #[test]
+    fn two_bot_pingpong_human_resets() {
+        let mut t = BotTurnTracker::new(20);
+        for _ in 0..15 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        t.on_human_message("t1");
+        for _ in 0..15 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        for _ in 0..4 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
+    }
+
+    #[test]
+    fn soft_limit_warn_once_semantics() {
+        let mut t = BotTurnTracker::new(20);
+        for _ in 0..19 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::SoftLimit(20));
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Throttled);
+    }
+
+    #[test]
+    fn hard_limit_warn_once_semantics() {
+        let mut t = BotTurnTracker::new(HARD_BOT_TURN_LIMIT + 1);
+        for _ in 0..HARD_BOT_TURN_LIMIT - 1 {
+            assert_eq!(t.on_bot_message("t1"), TurnResult::Ok);
+        }
+        assert_eq!(t.on_bot_message("t1"), TurnResult::HardLimit);
+        assert_eq!(t.on_bot_message("t1"), TurnResult::Stopped);
+    }
+}
