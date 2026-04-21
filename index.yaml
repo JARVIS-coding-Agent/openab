@@ -183,6 +183,17 @@ entries:
     version: 0.1.1
   openab:
   - apiVersion: v2
+    appVersion: 0.8.0
+    created: "2026-04-21T02:50:39.748960074Z"
+    description: A lightweight, secure, cloud-native ACP harness that bridges Discord
+      and any ACP-compatible coding CLI.
+    digest: ab6d4f3373f68b91c432669b76f365f9f8bdffe86ebf23a4abf54c95518e1aac
+    name: openab
+    type: application
+    urls:
+    - https://github.com/JARVIS-coding-Agent/openab/releases/download/openab-0.8.0/openab-0.8.0.tgz
+    version: 0.8.0
+  - apiVersion: v2
     appVersion: 0.7.8-beta.5
     created: "2026-04-19T07:10:53.476879485Z"
     description: A lightweight, secure, cloud-native ACP harness that bridges Discord
@@ -528,4 +539,4 @@ entries:
     urls:
     - https://github.com/openabdev/openab/releases/download/openab-0.3.3/openab-0.3.3.tgz
     version: 0.3.3
-generated: "2026-04-19T07:10:53.477339634Z"
+generated: "2026-04-21T02:50:39.749474079Z"
