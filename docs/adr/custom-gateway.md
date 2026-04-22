@@ -222,6 +222,8 @@ The gateway turns OAB from a "chat bot" into an **event-driven agent platform**:
 
 The key insight: OAB's session pool and agent runtime are platform-agnostic. The only platform-specific code lives in gateway adapters. Once the gateway exists, any HTTP event source can drive an agent session.
 
+This also lowers the barrier to entry: triggering an agent no longer requires setting up a chat platform bot. A simple `curl -X POST https://gateway/webhook/custom -d '{"text": "run daily security scan"}'` from a cron job is enough to start an agent session — no SDK, no bot token, no platform account needed.
+
 ---
 
 ## 6. Architectural Differences from v1
