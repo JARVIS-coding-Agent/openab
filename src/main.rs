@@ -262,3 +262,64 @@ fn parse_id_set(raw: &[String], label: &str) -> anyhow::Result<HashSet<u64>> {
     }
     Ok(set)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn cli_no_args_defaults_to_run() {
+        let cli = Cli::try_parse_from(["openab"]).unwrap();
+        assert!(cli.command.is_none()); // None → unwrap_or(Run { config: None })
+    }
+
+    #[test]
+    fn cli_run_with_local_config() {
+        let cli = Cli::try_parse_from(["openab", "run", "my-config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { config } => assert_eq!(config.unwrap(), "my-config.toml"),
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn cli_run_with_remote_url() {
+        let cli = Cli::try_parse_from(["openab", "run", "https://example.com/config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::Run { config } => {
+                let src = config.unwrap();
+                assert!(src.starts_with("https://"));
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn cli_bare_url_captured_by_external_subcommand() {
+        let cli = Cli::try_parse_from(["openab", "https://example.com/config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::External(args) => {
+                assert_eq!(args.first().unwrap(), "https://example.com/config.toml");
+            }
+            _ => panic!("expected External"),
+        }
+    }
+
+    #[test]
+    fn cli_bare_local_path_captured_by_external_subcommand() {
+        let cli = Cli::try_parse_from(["openab", "my-config.toml"]).unwrap();
+        match cli.command.unwrap() {
+            Commands::External(args) => {
+                assert_eq!(args.first().unwrap(), "my-config.toml");
+            }
+            _ => panic!("expected External"),
+        }
+    }
+
+    #[test]
+    fn cli_setup_subcommand() {
+        let cli = Cli::try_parse_from(["openab", "setup"]).unwrap();
+        assert!(matches!(cli.command.unwrap(), Commands::Setup { .. }));
+    }
+}
