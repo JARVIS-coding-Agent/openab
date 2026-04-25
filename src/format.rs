@@ -208,25 +208,6 @@ mod tests {
         }
     }
 
-    /// Helper: assert concatenating all chunks (with empty joiner) reconstructs
-    /// content that, when fence wrappers are stripped, equals the original.
-    fn assert_roundtrip(original: &str, chunks: &[String]) {
-        let joined = chunks.join("");
-        // Strip all auto-inserted close/reopen pairs: "\n```\n```..." pattern
-        let cleaned = joined
-            .replace("\n```\n```", "\n")
-            .replace("\n```\n```", "\n");
-        // Loose check: all original non-fence content is present
-        for line in original.split('\n') {
-            if !line.starts_with("```") {
-                assert!(
-                    cleaned.contains(line),
-                    "original line missing from output: {line}"
-                );
-            }
-        }
-    }
-
     #[test]
     fn no_split_under_limit() {
         let text = "hello\nworld";

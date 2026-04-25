@@ -49,7 +49,7 @@ pub fn convert_tables(markdown: &str, mode: TableMode) -> String {
         return markdown.to_string();
     }
 
-    let segments = parse_segments(markdown, mode);
+    let segments = parse_segments(markdown);
 
     let mut out = String::with_capacity(markdown.len());
     for seg in segments {
@@ -69,7 +69,7 @@ pub fn convert_tables(markdown: &str, mode: TableMode) -> String {
 
 /// Walk the markdown source with pulldown-cmark and split it into
 /// text segments and parsed Table segments.
-fn parse_segments(markdown: &str, mode: TableMode) -> Vec<Segment> {
+fn parse_segments(markdown: &str) -> Vec<Segment> {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
 
@@ -131,15 +131,9 @@ fn parse_segments(markdown: &str, mode: TableMode) -> Vec<Segment> {
                 cell_buf.push_str(&t);
             }
             Event::Code(t) if in_table => {
-                // In Code mode the table is already inside a fenced code block,
-                // so backticks would render as literal characters. Strip them.
-                if mode != TableMode::Code {
-                    cell_buf.push('`');
-                }
+                cell_buf.push('`');
                 cell_buf.push_str(&t);
-                if mode != TableMode::Code {
-                    cell_buf.push('`');
-                }
+                cell_buf.push('`');
             }
             // Inline markup inside cells: collect text, ignore tags
             Event::SoftBreak if in_table => {
@@ -194,12 +188,21 @@ fn render_table_code(table: &Table, out: &mut String) {
         return;
     }
 
+    // Strip backticks from cells — inside a code fence they render as literals.
+    let strip = |s: &str| s.replace('`', "");
+    let headers: Vec<String> = table.headers.iter().map(|h| strip(h)).collect();
+    let rows: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|r| r.iter().map(|c| strip(c)).collect())
+        .collect();
+
     // Compute column widths (using display width for CJK/emoji)
     let mut widths = vec![0usize; col_count];
-    for (i, h) in table.headers.iter().enumerate() {
+    for (i, h) in headers.iter().enumerate() {
         widths[i] = widths[i].max(UnicodeWidthStr::width(h.as_str()));
     }
-    for row in &table.rows {
+    for row in &rows {
         for (i, cell) in row.iter().enumerate() {
             if i < col_count {
                 widths[i] = widths[i].max(UnicodeWidthStr::width(cell.as_str()));
@@ -214,7 +217,7 @@ fn render_table_code(table: &Table, out: &mut String) {
     out.push_str("```\n");
 
     // Header row
-    write_row(out, &table.headers, &widths, col_count);
+    write_row(out, &headers, &widths, col_count);
     // Divider
     out.push('|');
     for w in &widths {
@@ -226,7 +229,7 @@ fn render_table_code(table: &Table, out: &mut String) {
     }
     out.push('\n');
     // Data rows
-    for row in &table.rows {
+    for row in &rows {
         write_row(out, row, &widths, col_count);
     }
 
