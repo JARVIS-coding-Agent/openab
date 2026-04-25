@@ -114,6 +114,18 @@ data:
     model = {{ ($cfg.stt).model | default "whisper-large-v3-turbo" | toJson }}
     base_url = {{ ($cfg.stt).baseUrl | default "https://api.groq.com/openai/v1" | toJson }}
     {{- end }}
+    {{- if ($cfg.gateway).url }}
+
+    [gateway]
+    url = {{ ($cfg.gateway).url | toJson }}
+    platform = {{ ($cfg.gateway).platform | default "telegram" | toJson }}
+    {{- if ($cfg.gateway).token }}
+    token = "${GATEWAY_WS_TOKEN}"
+    {{- end }}
+    {{- if ($cfg.gateway).botUsername }}
+    bot_username = {{ ($cfg.gateway).botUsername | toJson }}
+    {{- end }}
+    {{- end }}
   {{- if $cfg.agentsMd }}
   AGENTS.md: |
     {{- $cfg.agentsMd | nindent 4 }}
