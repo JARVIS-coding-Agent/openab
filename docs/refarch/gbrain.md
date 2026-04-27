@@ -1,8 +1,42 @@
-# OAB + GBrain Reference Architecture
+# OpenAB + GBrain Reference Architecture
 
 Shared persistent memory for OpenAB multi-agent deployments.
 
-## Architecture
+## Background — The Isolation Problem
+
+When running multiple AI agents through OpenAB (e.g. Kiro + Claude Code + Copilot), each agent pod operates in complete isolation:
+
+- **No shared memory** — Agent A discovers a critical finding, but Agent B has no way to access it.
+- **No cross-agent context** — Handing off a task means losing all the context the previous agent built up.
+- **No persistent knowledge** — Everything an agent learns is gone when the session ends. The next session starts from zero.
+
+In a single-agent setup this is tolerable. In a multi-agent deployment — which is the whole point of OpenAB — it becomes a serious bottleneck. Agents duplicate work, miss context, and cannot collaborate on anything beyond the current conversation.
+
+What we need is a **shared brain**: a persistent, queryable knowledge layer that all agents can read from and write to, in real time.
+
+## GBrain — A Shared Brain for AI Agents
+
+[GBrain](https://github.com/garrytan/gbrain) is an open-source persistent memory system built on PostgreSQL + pgvector. It was designed specifically for AI agent workflows.
+
+What makes it a good fit:
+
+- **MCP native** — Exposes 30+ tools via the standard MCP protocol. Any ACP CLI that supports MCP (Kiro, Claude Code, Copilot, Gemini, OpenCode, etc.) can use it out of the box — no custom integration needed.
+- **Hybrid search** — Combines vector similarity, keyword matching, and knowledge graph traversal. Agents get high-quality retrieval, not just embedding cosine distance.
+- **Structured knowledge** — Pages with markdown + frontmatter + tags, typed links between entities (`assigned_to`, `depends_on`, …), and chronological timelines per entity.
+- **Simple deployment** — One PostgreSQL instance, one CLI binary. No external services, no API keys, no complex infrastructure.
+
+```
+Capabilities:
+  • Pages        markdown + frontmatter + tags
+  • Search       hybrid (vector + keyword + graph)
+  • Links        typed edges (assigned_to, depends_on, …)
+  • Timeline     chronological events per entity
+  • 30+ tools    exposed via MCP (brain_write, brain_query, …)
+```
+
+## How GBrain Fits into OpenAB
+
+The integration is straightforward: each OAB agent pod runs `gbrain serve` as a local MCP server, and all instances point to the same PostgreSQL database. One agent writes a page → all others can query it instantly.
 
 ```
   Discord / Slack / Telegram / LINE
@@ -21,16 +55,41 @@ Shared persistent memory for OpenAB multi-agent deployments.
      └───────────────────┘
 ```
 
-All agents read/write the same DB. One agent writes a page → all others can query it instantly.
+**Zero coupling** — GBrain is an add-on, not a dependency. OpenAB works fine without it. You opt in when you need cross-agent memory.
 
 - **OpenAB**: https://github.com/openabdev/openab
 - **GBrain**: https://github.com/garrytan/gbrain
 
+### Cross-Agent Workflow Example
+
+```
+┌─ Agent A writes ──────────────────────────────────────────┐
+│                                                           │
+│  gbrain put handoff/task-42   ← structured page           │
+│  gbrain link handoff/task-42 agent/B --type assigned_to   │
+│                                                           │
+├─ Agent B queries ─────────────────────────────────────────┤
+│                                                           │
+│  gbrain query "what tasks are assigned to me?"            │
+│  gbrain get handoff/task-42   ← full context              │
+│                                                           │
+└───────────────────────────────────────────────────────────┘
+```
+
 ---
 
-## Option A — Manual Setup
+## Deployment
 
-For existing OAB deployments. No Helm changes needed.
+Two paths depending on where you are with OpenAB.
+
+| Path | For whom | Helm changes |
+|------|----------|-------------|
+| **Option A — Manual** | Existing OpenAB users who want GBrain now | None |
+| **Option B — Helm Integrated** | Future official support | New `gbrain.enabled` value |
+
+### Option A — Manual Setup
+
+For existing OpenAB deployments. No Helm changes needed.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -79,15 +138,13 @@ For existing OAB deployments. No Helm changes needed.
 └─────────────────────────────────────────────────────────┘
 ```
 
-Data lives on PVC — survives pod restarts when `persistence.enabled: true` (OAB default).
+Data lives on PVC — survives pod restarts when `persistence.enabled: true` (OpenAB default).
 
----
-
-## Option B — Helm Integrated
+### Option B — Helm Integrated
 
 > ⚠️ **Future work** — this section describes a target-state design that is not yet implemented. It is included to guide future Helm integration efforts.
 
-Target state: GBrain as a built-in OAB Helm component.
+Target state: GBrain as a built-in OpenAB Helm component.
 
 ```
 values.yaml                          What the chart does
@@ -113,29 +170,4 @@ MCP config auto-detection:
   command contains "claude"  → ~/.claude/server.json
   command contains "copilot" → ~/.copilot/mcp-config.json
   fallback                   → ~/.config/mcp/servers.json
-```
-
----
-
-## What GBrain gives your agents
-
-```
-┌─ Agent A writes ──────────────────────────────────────────┐
-│                                                           │
-│  gbrain put handoff/task-42   ← structured page           │
-│  gbrain link handoff/task-42 agent/B --type assigned_to   │
-│                                                           │
-├─ Agent B queries ─────────────────────────────────────────┤
-│                                                           │
-│  gbrain query "what tasks are assigned to me?"            │
-│  gbrain get handoff/task-42   ← full context              │
-│                                                           │
-└───────────────────────────────────────────────────────────┘
-
-Capabilities:
-  • Pages        markdown + frontmatter + tags
-  • Search       hybrid (vector + keyword + graph)
-  • Links        typed edges (assigned_to, depends_on, …)
-  • Timeline     chronological events per entity
-  • 30+ tools    exposed via MCP (brain_write, brain_query, …)
 ```
