@@ -67,6 +67,10 @@ For existing OAB deployments. No Helm changes needed.
 │    {"mcpServers":{"gbrain":{                            │
 │      "command":"~/.local/bin/gbrain",                   │
 │      "args":["serve"]}}}                                │
+│                                                         │
+│    ⚠ Note: ~ may not expand in all environments.        │
+│    Use $HOME or an absolute path if your MCP client     │
+│    or init container does not perform tilde expansion.   │
 ├─────────────────────────────────────────────────────────┤
 │ 3. Verify                                               │
 │                                                         │
@@ -80,6 +84,8 @@ Data lives on PVC — survives pod restarts when `persistence.enabled: true` (OA
 ---
 
 ## Option B — Helm Integrated
+
+> ⚠️ **Future work** — this section describes a target-state design that is not yet implemented. It is included to guide future Helm integration efforts.
 
 Target state: GBrain as a built-in OAB Helm component.
 
