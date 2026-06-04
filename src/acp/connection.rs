@@ -89,10 +89,18 @@ fn push_limited(lines: &mut VecDeque<String>, line: String) {
     lines.push_back(line);
 }
 
-/// Sanitize a diagnostic line: strip control chars, cap length, redact secrets.
+/// Regex for ANSI escape sequences (CSI sequences like \x1b[31m, \x1b[0m, etc.)
+static ANSI_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ANSI regex must compile")
+});
+
+/// Sanitize a diagnostic line: strip ANSI escapes, strip control chars, cap length, redact secrets.
 pub(crate) fn sanitize_diagnostic_line(line: &str) -> String {
+    // First strip ANSI escape sequences (e.g. \x1b[31m) so they don't leave
+    // residual bracket/number fragments after control char removal.
+    let stripped = ANSI_ESCAPE.replace_all(line.trim(), "");
     let mut out = String::new();
-    for ch in line.trim().chars() {
+    for ch in stripped.chars() {
         if out.len() >= DIAGNOSTIC_LINE_MAX_CHARS {
             out.push_str(" [truncated]");
             break;
