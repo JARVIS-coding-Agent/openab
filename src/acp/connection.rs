@@ -33,10 +33,11 @@ static SECRET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         r"|gho_[a-zA-Z0-9]{36,}",
         // Bearer tokens
         r"|(?:bearer\s+)[a-zA-Z0-9_.~+/=-]{20,}",
-        // Generic KEY=value or TOKEN=value patterns
-        r"|(?:_(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)\S+",
-        // PEM private keys
-        r"|-----BEGIN\s[A-Z\s]*PRIVATE\sKEY-----[\s\S]*?-----END\s[A-Z\s]*PRIVATE\sKEY-----",
+        // Generic KEY=value or TOKEN=value patterns (with or without prefix)
+        r"|(?:(?:^|[\s=])(?:\w*_)?(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)\S+",
+        // PEM private key markers (single-line detection; multi-line keys
+        // are handled line-by-line — the BEGIN line itself is sufficient signal)
+        r"|-----BEGIN\s[A-Z\s]*PRIVATE\sKEY-----",
         r")",
     ))
     .expect("secret redaction regex must compile")
@@ -104,7 +105,7 @@ pub(crate) fn sanitize_diagnostic_line(line: &str) -> String {
 }
 
 /// Replace known secret patterns with [REDACTED].
-fn redact_secrets(line: &str) -> String {
+pub(crate) fn redact_secrets(line: &str) -> String {
     SECRET_PATTERN.replace_all(line, "[REDACTED]").into_owned()
 }
 

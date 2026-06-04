@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use tracing::{error, warn};
 
-use crate::acp::{classify_notification, AcpEvent, ContentBlock, SessionPool};
+use crate::acp::{classify_notification, redact_secrets, AcpEvent, ContentBlock, SessionPool};
 use crate::config::{ReactionsConfig, ToolDisplay};
 use crate::error_display::{format_coded_error, format_user_error};
 use crate::format;
@@ -539,11 +539,13 @@ impl AdapterRouter {
                             },
                             _ = tokio::time::sleep(liveness_check_interval) => {
                                 if !conn.alive() {
+                                    conn.log_diagnostics("agent process died", Some(request_id)).await;
                                     response_error = Some("Agent process died".into());
                                     conn.abandon_request(request_id).await;
                                     break;
                                 }
                                 if prompt_start.elapsed() > prompt_hard_timeout {
+                                    conn.log_diagnostics("prompt hard timeout", Some(request_id)).await;
                                     response_error = Some(format!(
                                         "Agent exceeded hard timeout ({}s)",
                                         prompt_hard_timeout.as_secs(),
@@ -565,10 +567,11 @@ impl AdapterRouter {
                             }
                             if let Some(ref err) = notification.error {
                                 let stderr_tail = conn.stderr_tail_snapshot().await;
+                                let detail = err.user_detail().map(|d| redact_secrets(&d));
                                 response_error = Some(format_coded_error(
                                     err.code,
                                     &err.message,
-                                    err.user_detail().as_deref(),
+                                    detail.as_deref(),
                                     &stderr_tail,
                                 ));
                             }
