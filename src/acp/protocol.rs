@@ -72,6 +72,38 @@ impl JsonRpcError {
             .and_then(|d| d.get("message"))
             .and_then(|m| m.as_str())
     }
+
+    /// Extract user-facing detail with nested JSON unwrapping.
+    ///
+    /// Some agents (e.g. codex-acp) encode the real upstream error as a JSON
+    /// string inside `error.data.message`. This method first tries plain string
+    /// extraction, then attempts to parse the string as JSON and extract
+    /// `.error.message` from within it (the nested case from issue #998).
+    pub fn user_detail(&self) -> Option<String> {
+        let raw = self.data_message()?;
+        if raw.is_empty() {
+            return None;
+        }
+        // Try parsing as nested JSON: {"error": {"message": "..."}}
+        if raw.starts_with('{') {
+            if let Ok(inner) = serde_json::from_str::<serde_json::Value>(raw) {
+                if let Some(msg) = inner
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                {
+                    return Some(msg.to_string());
+                }
+                // Fallback: just use the nested "message" if present
+                if let Some(msg) = inner.get("message").and_then(|m| m.as_str()) {
+                    if !msg.is_empty() {
+                        return Some(msg.to_string());
+                    }
+                }
+            }
+        }
+        Some(raw.to_string())
+    }
 }
 
 impl std::fmt::Display for JsonRpcError {
@@ -402,5 +434,68 @@ mod tests {
         let opts = parse_config_options(&result);
         assert_eq!(opts.len(), 1);
         assert_eq!(opts[0].id, "model");
+    }
+
+    // ─── user_detail tests (nested JSON parsing, #998/#1002) ────────────────
+
+    #[test]
+    fn user_detail_plain_string() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({"message": "model not supported"})),
+        };
+        assert_eq!(err.user_detail(), Some("model not supported".to_string()));
+    }
+
+    #[test]
+    fn user_detail_nested_json() {
+        // codex-acp wraps upstream errors as JSON inside data.message
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({"message": "{\"error\":{\"message\":\"invalid_api_key\"}}"})),
+        };
+        assert_eq!(err.user_detail(), Some("invalid_api_key".to_string()));
+    }
+
+    #[test]
+    fn user_detail_nested_json_with_message_key() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({"message": "{\"message\":\"rate limit exceeded\"}"})),
+        };
+        assert_eq!(err.user_detail(), Some("rate limit exceeded".to_string()));
+    }
+
+    #[test]
+    fn user_detail_empty_data() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({})),
+        };
+        assert_eq!(err.user_detail(), None);
+    }
+
+    #[test]
+    fn user_detail_empty_string() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({"message": ""})),
+        };
+        assert_eq!(err.user_detail(), None);
+    }
+
+    #[test]
+    fn user_detail_no_data() {
+        let err = JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: None,
+        };
+        assert_eq!(err.user_detail(), None);
     }
 }

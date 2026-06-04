@@ -2,15 +2,111 @@ use crate::acp::protocol::{
     parse_config_options, ConfigOption, JsonRpcMessage, JsonRpcRequest, JsonRpcResponse,
 };
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info, trace};
+use tracing::{debug, error, info, trace, warn};
+
+/// Maximum number of recent diagnostic lines kept per category.
+const DIAGNOSTIC_LINE_LIMIT: usize = 50;
+/// Maximum characters per diagnostic line before truncation.
+const DIAGNOSTIC_LINE_MAX_CHARS: usize = 500;
+
+/// Regex patterns for common secret formats that must be redacted before
+/// diagnostic lines are stored or displayed to users.
+static SECRET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"(?i)",
+        r"(?:",
+        // API keys with known prefixes
+        r"sk-ant-[a-zA-Z0-9_-]{10,}",
+        r"|sk-[a-zA-Z0-9_-]{20,}",
+        r"|ghp_[a-zA-Z0-9]{36,}",
+        r"|github_pat_[a-zA-Z0-9_]{22,}",
+        r"|xox[bpras]-[a-zA-Z0-9-]{10,}",
+        r"|gho_[a-zA-Z0-9]{36,}",
+        // Bearer tokens
+        r"|(?:bearer\s+)[a-zA-Z0-9_.~+/=-]{20,}",
+        // Generic KEY=value or TOKEN=value patterns
+        r"|(?:_(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)\S+",
+        // PEM private keys
+        r"|-----BEGIN\s[A-Z\s]*PRIVATE\sKEY-----[\s\S]*?-----END\s[A-Z\s]*PRIVATE\sKEY-----",
+        r")",
+    ))
+    .expect("secret redaction regex must compile")
+});
+
+/// Rolling diagnostic buffer for a single ACP session.
+/// Captures recent stderr and malformed stdout lines for error reporting.
+/// Scoped per session — torn down with the connection, no leak risk.
+#[derive(Default)]
+pub(crate) struct AgentDiagnostics {
+    stderr: VecDeque<String>,
+    malformed_stdout: VecDeque<String>,
+}
+
+/// Snapshot of diagnostic state at a point in time.
+#[derive(Default)]
+pub(crate) struct DiagnosticSnapshot {
+    pub stderr: Vec<String>,
+    pub malformed_stdout: Vec<String>,
+}
+
+impl DiagnosticSnapshot {
+    pub fn is_empty(&self) -> bool {
+        self.stderr.is_empty() && self.malformed_stdout.is_empty()
+    }
+}
+
+impl AgentDiagnostics {
+    fn push_stderr(&mut self, line: String) {
+        push_limited(&mut self.stderr, line);
+    }
+
+    fn push_malformed_stdout(&mut self, line: String) {
+        push_limited(&mut self.malformed_stdout, line);
+    }
+
+    pub fn snapshot(&self) -> DiagnosticSnapshot {
+        DiagnosticSnapshot {
+            stderr: self.stderr.iter().cloned().collect(),
+            malformed_stdout: self.malformed_stdout.iter().cloned().collect(),
+        }
+    }
+}
+
+fn push_limited(lines: &mut VecDeque<String>, line: String) {
+    if lines.len() >= DIAGNOSTIC_LINE_LIMIT {
+        lines.pop_front();
+    }
+    lines.push_back(line);
+}
+
+/// Sanitize a diagnostic line: strip control chars, cap length, redact secrets.
+pub(crate) fn sanitize_diagnostic_line(line: &str) -> String {
+    let mut out = String::new();
+    for ch in line.trim().chars() {
+        if out.len() >= DIAGNOSTIC_LINE_MAX_CHARS {
+            out.push_str(" [truncated]");
+            break;
+        }
+        if !ch.is_control() || ch == '\t' {
+            out.push(ch);
+        }
+    }
+    redact_secrets(&out)
+}
+
+/// Replace known secret patterns with [REDACTED].
+fn redact_secrets(line: &str) -> String {
+    SECRET_PATTERN.replace_all(line, "[REDACTED]").into_owned()
+}
 
 /// Pick the most permissive selectable permission option from ACP options.
 fn pick_best_option(options: &[Value]) -> Option<String> {
@@ -115,6 +211,7 @@ pub struct AcpConnection {
     next_id: AtomicU64,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    diagnostics: Arc<Mutex<AgentDiagnostics>>,
     pub acp_session_id: Option<String>,
     pub supports_load_session: bool,
     pub config_options: Vec<ConfigOption>,
@@ -160,6 +257,7 @@ pub(crate) async fn run_reader_loop<R, W>(
     writer: Arc<Mutex<W>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<JsonRpcMessage>>>>,
     notify_tx: Arc<Mutex<Option<mpsc::UnboundedSender<JsonRpcMessage>>>>,
+    diagnostics: Arc<Mutex<AgentDiagnostics>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -178,7 +276,18 @@ pub(crate) async fn run_reader_loop<R, W>(
         }
         let msg: JsonRpcMessage = match serde_json::from_str(line.trim()) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                let sanitized = sanitize_diagnostic_line(&line);
+                if !sanitized.is_empty() {
+                    warn!(
+                        parse_error = %e,
+                        line = %sanitized,
+                        "agent stdout was not valid JSON-RPC"
+                    );
+                    diagnostics.lock().await.push_malformed_stdout(sanitized);
+                }
+                continue;
+            }
         };
         debug!(line = line.trim(), "acp_recv");
 
@@ -356,11 +465,16 @@ impl AcpConnection {
         let stdout = proc.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;
         let stdin = proc.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdin = Arc::new(Mutex::new(stdin));
+        let diagnostics: Arc<Mutex<AgentDiagnostics>> =
+            Arc::new(Mutex::new(AgentDiagnostics::default()));
 
         // Capture agent stderr and log it (ACP spec: agents MAY write to stderr
         // for logging; clients MAY capture or ignore it).
+        // Each sanitized+redacted line is pushed to the per-session diagnostics
+        // buffer so opaque JSON-RPC errors can surface the real cause to users.
         let stderr_handle = if let Some(stderr) = proc.stderr.take() {
             let cmd_name = command.to_string();
+            let diag = Arc::clone(&diagnostics);
             Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
@@ -369,14 +483,10 @@ impl AcpConnection {
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(_) => {
-                            let trimmed = line.trim();
-                            if !trimmed.is_empty() {
-                                let sanitized: String = trimmed.chars()
-                                    .filter(|c| !c.is_control() || *c == '\t')
-                                    .collect();
-                                if !sanitized.is_empty() {
-                                    tracing::warn!(agent = %cmd_name, "{sanitized}");
-                                }
+                            let sanitized = sanitize_diagnostic_line(&line);
+                            if !sanitized.is_empty() {
+                                tracing::warn!(agent = %cmd_name, "{sanitized}");
+                                diag.lock().await.push_stderr(sanitized);
                             }
                         }
                         Err(_) => break,
@@ -397,6 +507,7 @@ impl AcpConnection {
             stdin.clone(),
             pending.clone(),
             notify_tx.clone(),
+            diagnostics.clone(),
         ));
 
         Ok(Self {
@@ -406,6 +517,7 @@ impl AcpConnection {
             next_id: AtomicU64::new(1),
             pending,
             notify_tx,
+            diagnostics,
             acp_session_id: None,
             supports_load_session: false,
             config_options: Vec::new(),
@@ -418,6 +530,33 @@ impl AcpConnection {
 
     fn next_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Snapshot recent stderr lines for user-facing error display.
+    /// Returns lines in chronological order (oldest first, newest last).
+    pub async fn stderr_tail_snapshot(&self) -> Vec<String> {
+        self.diagnostics.lock().await.stderr.iter().cloned().collect()
+    }
+
+    /// Log a structured ERROR with recent diagnostics when the agent fails
+    /// without returning a JSON-RPC error (EOF, process death, timeout).
+    pub async fn log_diagnostics(&self, reason: &str, request_id: Option<u64>) {
+        let snapshot = self.diagnostics.lock().await.snapshot();
+        if snapshot.is_empty() {
+            error!(
+                reason,
+                ?request_id,
+                "agent request failed without JSON-RPC error"
+            );
+            return;
+        }
+        error!(
+            reason,
+            ?request_id,
+            recent_stderr = ?snapshot.stderr,
+            recent_malformed_stdout = ?snapshot.malformed_stdout,
+            "agent request failed without JSON-RPC error"
+        );
     }
 
     pub(crate) async fn send_raw(&self, data: &str) -> Result<()> {
@@ -861,11 +1000,13 @@ mod reader_loop_tests {
         *notify_tx.lock().await = Some(sub_tx);
 
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let diag: Arc<Mutex<AgentDiagnostics>> = Arc::new(Mutex::new(AgentDiagnostics::default()));
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
             writer,
             pending.clone(),
             notify_tx.clone(),
+            diag.clone(),
         ));
 
         let stale = b"{\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"stopReason\":\"ok\"}}\n";
@@ -907,11 +1048,13 @@ mod reader_loop_tests {
         *notify_tx.lock().await = Some(sub_tx);
 
         let writer = Arc::new(Mutex::new(agent_stdin_writer));
+        let diag: Arc<Mutex<AgentDiagnostics>> = Arc::new(Mutex::new(AgentDiagnostics::default()));
         let handle = tokio::spawn(run_reader_loop(
             agent_stdout_reader,
             writer,
             pending.clone(),
             notify_tx.clone(),
+            diag.clone(),
         ));
 
         let payload = b"{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stopReason\":\"end_turn\"}}\n";
@@ -933,5 +1076,107 @@ mod reader_loop_tests {
 
         drop(agent_stdout_writer);
         handle.await.unwrap();
+    }
+
+    // ─── sanitize_diagnostic_line tests ─────────────────────────────────────
+
+    #[test]
+    fn sanitize_strips_control_chars() {
+        let input = "hello\x00world\x1b[31mred";
+        let result = sanitize_diagnostic_line(input);
+        assert_eq!(result, "helloworldred");
+    }
+
+    #[test]
+    fn sanitize_preserves_tabs() {
+        let input = "col1\tcol2\tcol3";
+        let result = sanitize_diagnostic_line(input);
+        assert_eq!(result, "col1\tcol2\tcol3");
+    }
+
+    #[test]
+    fn sanitize_truncates_long_lines() {
+        let input = "x".repeat(1000);
+        let result = sanitize_diagnostic_line(&input);
+        assert!(result.len() <= DIAGNOSTIC_LINE_MAX_CHARS + 15); // chars + " [truncated]"
+        assert!(result.ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn sanitize_trims_whitespace() {
+        let result = sanitize_diagnostic_line("  hello world  \n");
+        assert_eq!(result, "hello world");
+    }
+
+    // ─── redaction tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn redact_anthropic_key() {
+        let input = "Error: key is sk-ant-api03-abcdefg1234567890";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("sk-ant-"));
+    }
+
+    #[test]
+    fn redact_openai_key() {
+        let input = "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwx";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("sk-proj-"));
+    }
+
+    #[test]
+    fn redact_github_pat() {
+        let input = "token: github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("github_pat_"));
+    }
+
+    #[test]
+    fn redact_ghp_token() {
+        let input = "Authorization failed with ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("ghp_"));
+    }
+
+    #[test]
+    fn redact_slack_token() {
+        let input = "SLACK_TOKEN=xoxb-123456789-abcdefg";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("xoxb-"));
+    }
+
+    #[test]
+    fn redact_bearer_token() {
+        let input = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("eyJhbGci"));
+    }
+
+    #[test]
+    fn redact_generic_api_key_env() {
+        let input = "ANTHROPIC_API_KEY=sk-ant-something-secret-here";
+        let result = redact_secrets(input);
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn no_redact_safe_content() {
+        let input = "Error: model 'gpt-5' not found in available models";
+        let result = redact_secrets(input);
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn sanitize_diagnostic_line_redacts_secrets() {
+        let input = "Failed auth: sk-ant-api03-mysecretkey1234567890";
+        let result = sanitize_diagnostic_line(input);
+        assert!(result.contains("[REDACTED]"));
+        assert!(!result.contains("mysecretkey"));
     }
 }

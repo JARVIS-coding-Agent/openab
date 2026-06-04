@@ -50,9 +50,29 @@ pub fn format_user_error(message: &str) -> String {
 
 /// Format coded error from ACP agent for display in Discord.
 /// Used for response errors that have a JSON-RPC or HTTP status code.
-/// `data_message` is the optional detail extracted from `error.data.message`.
+///
+/// `data_message` is the optional detail extracted from `error.data.message`
+/// (see PR #885) or via nested JSON unwrapping (from #1002/#998).
+///
+/// `stderr_tail` is the agent's recent stderr output, used as a fallback
+/// detail when `data_message` is absent or empty. Some agents (e.g. opencode
+/// in #25568, hermes-agent) return `-32603` with `data: {}` or no `data` at
+/// all, leaving only stderr to carry the real cause. See #1000, #998.
+///
+/// Rendering rules:
+/// 1. If `data_message` is present and non-empty, render it (existing path).
+/// 2. Else if `stderr_tail` is non-empty, render last 5 lines as a "Recent
+///    agent output:" blockquote (Discord message budget).
+/// 3. Else, plain `prefix (code: N)`.
+/// 4. `data_message` and `stderr_tail` are never shown together.
+///
 /// Public for reuse by other adapters (e.g. Slack).
-pub fn format_coded_error(code: i64, message: &str, data_message: Option<&str>) -> String {
+pub fn format_coded_error(
+    code: i64,
+    message: &str,
+    data_message: Option<&str>,
+    stderr_tail: &[String],
+) -> String {
     let prefix = match code {
         400 => "**Bad Request**",
         401 => "**Unauthorized**",
@@ -76,10 +96,23 @@ pub fn format_coded_error(code: i64, message: &str, data_message: Option<&str>) 
     } else {
         format!("{} (code: {})\n{}", prefix, code, message)
     };
-    if let Some(detail) = data_message {
-        if !detail.is_empty() && !message.contains(detail) {
+    // Normalize empty string to None so stderr fallback fires.
+    let detail = data_message.filter(|s| !s.is_empty());
+    if let Some(detail) = detail {
+        if !message.contains(detail) {
             out.push_str("\n> ");
             out.push_str(detail);
+        }
+    } else if !stderr_tail.is_empty() {
+        // Fallback: opaque error envelope, no structured `data` to extract.
+        // Show the last 5 lines so users get actionable signal without
+        // flooding the channel. Full history is in operator logs.
+        out.push_str("\n> _Recent agent output:_\n");
+        let start = stderr_tail.len().saturating_sub(5);
+        for line in &stderr_tail[start..] {
+            out.push_str("> ");
+            out.push_str(line);
+            out.push('\n');
         }
     }
     out
@@ -172,9 +205,13 @@ mod tests {
 
     // ─── format_coded_error tests ───────────────────────────────────────────
 
+    fn empty_tail() -> Vec<String> {
+        Vec::new()
+    }
+
     #[test]
     fn format_coded_error_401() {
-        let result = format_coded_error(401, "invalid token", None);
+        let result = format_coded_error(401, "invalid token", None, &empty_tail());
         assert!(result.contains("Unauthorized"));
         assert!(result.contains("401"));
         assert!(result.contains("invalid token"));
@@ -182,7 +219,7 @@ mod tests {
 
     #[test]
     fn format_coded_error_429() {
-        let result = format_coded_error(429, "", None);
+        let result = format_coded_error(429, "", None, &empty_tail());
         assert!(result.contains("Rate Limited"));
         assert!(result.contains("429"));
         assert!(!result.contains("\n")); // no message, no newline
@@ -190,7 +227,7 @@ mod tests {
 
     #[test]
     fn format_coded_error_503() {
-        let result = format_coded_error(503, "service unavailable", None);
+        let result = format_coded_error(503, "service unavailable", None, &empty_tail());
         assert!(result.contains("Service Unavailable"));
         assert!(result.contains("503"));
         assert!(result.contains("service unavailable"));
@@ -198,28 +235,28 @@ mod tests {
 
     #[test]
     fn format_coded_error_json_rpc() {
-        let result = format_coded_error(-32602, "missing required parameter", None);
+        let result = format_coded_error(-32602, "missing required parameter", None, &empty_tail());
         assert!(result.contains("Invalid Params"));
         assert!(result.contains("-32602"));
     }
 
     #[test]
     fn format_coded_error_server_error_range() {
-        let result = format_coded_error(-32050, "internal failure", None);
+        let result = format_coded_error(-32050, "internal failure", None, &empty_tail());
         assert!(result.contains("Server Error"));
         assert!(result.contains("-32050"));
     }
 
     #[test]
     fn format_coded_error_connection_error() {
-        let result = format_coded_error(-32000, "connection refused", None);
-        assert!(result.contains("Server Error")); // -32000 falls in -32099..=-32000 range
+        let result = format_coded_error(-32000, "connection refused", None, &empty_tail());
+        assert!(result.contains("Server Error"));
         assert!(result.contains("-32000"));
     }
 
     #[test]
     fn format_coded_error_unknown_code() {
-        let result = format_coded_error(999, "something happened", None);
+        let result = format_coded_error(999, "something happened", None, &empty_tail());
         assert!(result.contains("Error"));
         assert!(result.contains("999"));
         assert!(result.contains("something happened"));
@@ -227,15 +264,70 @@ mod tests {
 
     #[test]
     fn format_coded_error_with_data_message() {
-        let result = format_coded_error(-32603, "Internal error", Some("model not supported"));
+        let result =
+            format_coded_error(-32603, "Internal error", Some("model not supported"), &empty_tail());
         assert!(result.contains("Internal Error"));
         assert!(result.contains("model not supported"));
     }
 
     #[test]
     fn format_coded_error_data_message_not_duplicated() {
-        // If data_message is already in message, don't repeat it
-        let result = format_coded_error(-32603, "model not supported", Some("model not supported"));
+        let result = format_coded_error(
+            -32603,
+            "model not supported",
+            Some("model not supported"),
+            &empty_tail(),
+        );
         assert_eq!(result.matches("model not supported").count(), 1);
+    }
+
+    // ─── stderr_tail fallback tests (#1000 / #998) ──────────────────────────
+
+    #[test]
+    fn format_coded_error_stderr_tail_when_data_empty() {
+        let stderr = vec!["Error: ANTHROPIC_API_KEY not set".to_string()];
+        let result = format_coded_error(-32603, "Internal error", None, &stderr);
+        assert!(result.contains("Internal Error"));
+        assert!(result.contains("-32603"));
+        assert!(result.contains("Recent agent output"));
+        assert!(result.contains("ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn format_coded_error_data_message_suppresses_stderr() {
+        let stderr = vec!["DEBUG: connection pool idle".to_string()];
+        let result = format_coded_error(
+            -32603,
+            "Internal error",
+            Some("model not supported"),
+            &stderr,
+        );
+        assert!(result.contains("model not supported"));
+        assert!(!result.contains("Recent agent output"));
+        assert!(!result.contains("connection pool idle"));
+    }
+
+    #[test]
+    fn format_coded_error_stderr_tail_caps_at_five_lines() {
+        let stderr: Vec<String> = (1..=20).map(|i| format!("line {i}")).collect();
+        let result = format_coded_error(-32603, "Internal error", None, &stderr);
+        assert!(result.contains("line 16"));
+        assert!(result.contains("line 20"));
+        assert!(!result.contains("line 15"));
+    }
+
+    #[test]
+    fn format_coded_error_no_data_no_stderr() {
+        let result = format_coded_error(-32603, "Internal error", None, &empty_tail());
+        assert!(result.contains("Internal Error"));
+        assert!(!result.contains("Recent agent output"));
+    }
+
+    #[test]
+    fn format_coded_error_empty_data_string_falls_through_to_stderr() {
+        let stderr = vec!["real error in stderr".to_string()];
+        let result = format_coded_error(-32603, "Internal error", Some(""), &stderr);
+        assert!(result.contains("Recent agent output"));
+        assert!(result.contains("real error in stderr"));
     }
 }
