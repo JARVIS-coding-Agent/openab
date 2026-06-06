@@ -33,8 +33,10 @@ static SECRET_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
         r"|gho_[a-zA-Z0-9]{36,}",
         // Bearer tokens
         r"|(?:bearer\s+)[a-zA-Z0-9_.~+/=-]{20,}",
-        // Generic KEY=value or TOKEN=value patterns (with or without prefix)
-        r"|(?:(?:^|[\s=])(?:\w*_)?(?:API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)\S+",
+        // Generic KEY=value patterns — require prefix suggesting credential context
+        // (e.g. ANTHROPIC_API_KEY=, AUTH_TOKEN=, DB_PASSWORD=) but not arbitrary
+        // vars like MAX_RETRY_TOKEN=3 or LOG_SECRET=false.
+        r"|(?:(?:^|[\s=])(?:[A-Z_]*(?:API|AUTH|AWS|AZURE|GCP|OPENAI|ANTHROPIC|DATABASE|DB|REDIS|MONGO|SMTP|SSH|PRIVATE|SIGNING)[A-Z_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*=\s*)\S+",
         // PEM private key markers (single-line detection; multi-line keys
         // are handled line-by-line — the BEGIN line itself is sufficient signal)
         r"|-----BEGIN\s[A-Z\s]*PRIVATE\sKEY-----",
@@ -94,22 +96,27 @@ static ANSI_ESCAPE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("ANSI regex must compile")
 });
 
-/// Sanitize a diagnostic line: strip ANSI escapes, strip control chars, cap length, redact secrets.
+/// Sanitize a diagnostic line: strip ANSI escapes, strip control chars, redact secrets, then cap length.
 pub(crate) fn sanitize_diagnostic_line(line: &str) -> String {
     // First strip ANSI escape sequences (e.g. \x1b[31m) so they don't leave
     // residual bracket/number fragments after control char removal.
     let stripped = ANSI_ESCAPE.replace_all(line.trim(), "");
-    let mut out = String::new();
+    let mut clean = String::new();
     for ch in stripped.chars() {
-        if out.len() >= DIAGNOSTIC_LINE_MAX_CHARS {
-            out.push_str(" [truncated]");
-            break;
-        }
         if !ch.is_control() || ch == '\t' {
-            out.push(ch);
+            clean.push(ch);
         }
     }
-    redact_secrets(&out)
+    // Redact BEFORE truncating so secrets that would span the cutoff boundary
+    // are fully replaced rather than partially exposed.
+    let redacted = redact_secrets(&clean);
+    if redacted.chars().count() > DIAGNOSTIC_LINE_MAX_CHARS {
+        let mut out: String = redacted.chars().take(DIAGNOSTIC_LINE_MAX_CHARS).collect();
+        out.push_str(" [truncated]");
+        out
+    } else {
+        redacted
+    }
 }
 
 /// Replace known secret patterns with [REDACTED].
@@ -487,11 +494,30 @@ impl AcpConnection {
             Some(tokio::spawn(async move {
                 let mut reader = BufReader::new(stderr);
                 let mut line = String::new();
+                let mut in_pem_block = false;
                 loop {
                     line.clear();
                     match reader.read_line(&mut line).await {
                         Ok(0) => break,
                         Ok(_) => {
+                            let trimmed = line.trim();
+                            // Suppress lines inside PEM private key blocks
+                            if trimmed.contains("-----BEGIN") && trimmed.contains("PRIVATE KEY") {
+                                in_pem_block = true;
+                                let sanitized = sanitize_diagnostic_line(&line);
+                                if !sanitized.is_empty() {
+                                    tracing::warn!(agent = %cmd_name, "{sanitized}");
+                                    diag.lock().await.push_stderr(sanitized);
+                                }
+                                continue;
+                            }
+                            if in_pem_block {
+                                if trimmed.contains("-----END") && trimmed.contains("PRIVATE KEY") {
+                                    in_pem_block = false;
+                                }
+                                // Skip all lines inside PEM block (base64 body + END marker)
+                                continue;
+                            }
                             let sanitized = sanitize_diagnostic_line(&line);
                             if !sanitized.is_empty() {
                                 tracing::warn!(agent = %cmd_name, "{sanitized}");

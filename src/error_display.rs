@@ -111,11 +111,45 @@ pub fn format_coded_error(
         let start = stderr_tail.len().saturating_sub(5);
         for line in &stderr_tail[start..] {
             out.push_str("> ");
-            out.push_str(line);
+            out.push_str(&sanitize_mentions(line));
             out.push('\n');
         }
     }
     out
+}
+
+/// Strip Discord/Slack mention patterns from untrusted agent output so
+/// surfaced diagnostics cannot ping users or channels.
+/// Handles: <@ID>, <@!ID>, <@&ID>, <#ID>, @everyone, @here, <!here>, <!channel>, <!everyone>
+fn sanitize_mentions(line: &str) -> String {
+    let mut s = line.to_string();
+    // Discord mention patterns: <@123>, <@!123>, <@&123>, <#123>
+    while let Some(start) = s.find("<@") {
+        if let Some(end) = s[start..].find('>') {
+            s.replace_range(start..start + end + 1, "@\u{200B}mention");
+        } else {
+            break;
+        }
+    }
+    while let Some(start) = s.find("<#") {
+        if let Some(end) = s[start..].find('>') {
+            s.replace_range(start..start + end + 1, "#\u{200B}channel");
+        } else {
+            break;
+        }
+    }
+    // Slack special mentions: <!here>, <!channel>, <!everyone>
+    while let Some(start) = s.find("<!") {
+        if let Some(end) = s[start..].find('>') {
+            s.replace_range(start..start + end + 1, "@\u{200B}group");
+        } else {
+            break;
+        }
+    }
+    // Plain text @everyone / @here
+    s = s.replace("@everyone", "@\u{200B}everyone");
+    s = s.replace("@here", "@\u{200B}here");
+    s
 }
 
 #[cfg(test)]

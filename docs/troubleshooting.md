@@ -77,8 +77,7 @@ kubectl get pods -l app.kubernetes.io/name=openab -o jsonpath='{.items[0].spec.c
 ## Other categories
 
 - **Connection Lost** — agent process crashed mid-prompt. `kubectl logs` for the
-  broker will show `Agent process died` from the liveness check in
-  `AdapterRouter::stream_prompt_blocks`.
+  broker will show `Agent process died` from the broker's liveness check.
 - **Request Timeout** — agent didn't respond within 30s (or 120s for
   `session/new`). Either upstream is slow, agent is hung on a tool call, or
   the env config is wrong and initialization is looping.

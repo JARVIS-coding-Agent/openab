@@ -66,7 +66,7 @@ impl JsonRpcError {
     /// The `"message"` key is a convention used by codex-acp and aligns with
     /// common JSON-RPC practice, but is NOT mandated by the ACP spec.
     /// Other agents may use `"detail"`, `"reason"`, etc. — extend here if needed.
-    pub fn data_message(&self) -> Option<&str> {
+    pub(crate) fn data_message(&self) -> Option<&str> {
         self.data
             .as_ref()
             .and_then(|d| d.get("message"))
